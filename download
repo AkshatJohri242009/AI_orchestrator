@@ -1,0 +1,139 @@
+const express = require('express');
+
+// Controllers
+const authController = require('../controllers/authController');
+const keysController = require('../controllers/keysController');
+const orchestrateController = require('../controllers/orchestrateController');
+const memoryController = require('../controllers/memoryController');
+
+// Middleware
+const { authenticate } = require('../middleware/auth');
+const {
+  authLimiter,
+  aiLimiter,
+  handleValidationErrors,
+  validationRules,
+  auditLog,
+} = require('../middleware/security');
+const { body } = require('express-validator');
+
+const router = express.Router();
+
+// ============================================
+// AUTH ROUTES
+// ============================================
+router.post('/auth/register',
+  authLimiter,
+  validationRules.register,
+  handleValidationErrors,
+  authController.register
+);
+
+router.post('/auth/login',
+  authLimiter,
+  validationRules.login,
+  handleValidationErrors,
+  auditLog('login_attempt'),
+  authController.login
+);
+
+router.post('/auth/refresh', authController.refresh);
+
+router.post('/auth/logout', authenticate, authController.logout);
+
+router.get('/auth/me', authenticate, authController.getMe);
+
+// ============================================
+// API KEYS ROUTES
+// ============================================
+router.get('/keys', authenticate, keysController.listKeys);
+
+router.post('/keys',
+  authenticate,
+  validationRules.apiKey,
+  handleValidationErrors,
+  keysController.addKey
+);
+
+router.delete('/keys/:id', authenticate, keysController.deleteKey);
+
+router.patch('/keys/:id/toggle', authenticate, keysController.toggleKey);
+
+// ============================================
+// ORCHESTRATION ROUTES
+// ============================================
+router.post('/orchestrate/run',
+  authenticate,
+  aiLimiter,
+  [
+    body('prompt').isLength({ min: 1, max: 32000 }),
+    body('agents').isArray({ min: 1, max: 5 }),
+    body('mode').optional().isIn(['single', 'race', 'debate', 'chain']),
+  ],
+  handleValidationErrors,
+  orchestrateController.run
+);
+
+router.get('/orchestrate/models', authenticate, orchestrateController.getModels);
+
+// Agent CRUD
+router.get('/orchestrate/agents', authenticate, orchestrateController.listAgents);
+
+router.post('/orchestrate/agents',
+  authenticate,
+  validationRules.agentConfig,
+  handleValidationErrors,
+  orchestrateController.createAgent
+);
+
+router.put('/orchestrate/agents/:id', authenticate, orchestrateController.updateAgent);
+
+router.delete('/orchestrate/agents/:id', authenticate, orchestrateController.deleteAgent);
+
+// Conversations
+router.get('/orchestrate/conversations', authenticate, orchestrateController.listConversations);
+
+router.get('/orchestrate/conversations/:id', authenticate, orchestrateController.getConversation);
+
+// ============================================
+// MEMORY ROUTES
+// ============================================
+router.get('/memory', authenticate, memoryController.listMemory);
+
+router.post('/memory',
+  authenticate,
+  [
+    body('key').isLength({ min: 1, max: 255 }).trim(),
+    body('value').isLength({ min: 1 }),
+    body('category').optional().isLength({ max: 50 }),
+  ],
+  handleValidationErrors,
+  memoryController.upsertMemory
+);
+
+router.delete('/memory/clear', authenticate, memoryController.clearMemory);
+
+router.delete('/memory/:id', authenticate, memoryController.deleteMemory);
+
+router.get('/memory/categories', authenticate, memoryController.getCategories);
+
+// ============================================
+// HEALTH CHECK
+// ============================================
+router.get('/health', async (req, res) => {
+  const { healthCheck } = require('../database/db');
+  try {
+    const dbStatus = await healthCheck();
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      database: 'connected',
+      dbTime: dbStatus.current_time,
+      version: '1.0.0',
+    });
+  } catch (error) {
+    res.status(503).json({ status: 'unhealthy', database: 'disconnected' });
+  }
+});
+
+module.exports = router;

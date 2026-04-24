@@ -1,0 +1,208 @@
+import React, { useState, useEffect } from 'react';
+import { memoryAPI } from '../services/api';
+
+const CATEGORIES = ['general', 'preferences', 'project', 'context', 'facts', 'goals'];
+
+export default function MemoryManager({ toast }) {
+  const [memories, setMemories] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState({ category: '', search: '' });
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState({ key: '', value: '', category: 'general' });
+  const [saving, setSaving] = useState(false);
+
+  const load = async () => {
+    try {
+      const [memRes, catRes] = await Promise.all([
+        memoryAPI.list(filter),
+        memoryAPI.categories(),
+      ]);
+      setMemories(memRes.data.memories);
+      setCategories(catRes.data.categories);
+    } catch {
+      toast.error('Failed to load memory');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [filter]);
+
+  const handleSave = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      await memoryAPI.upsert(form);
+      toast.success('Memory saved');
+      setForm({ key: '', value: '', category: 'general' });
+      setShowAdd(false);
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Failed to save');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (id, key) => {
+    if (!window.confirm(`Delete "${key}"?`)) return;
+    try {
+      await memoryAPI.delete(id);
+      toast.success('Memory deleted');
+      load();
+    } catch {
+      toast.error('Failed to delete');
+    }
+  };
+
+  const handleClear = async () => {
+    if (!window.confirm('Clear ALL memories? This cannot be undone.')) return;
+    try {
+      await memoryAPI.clear();
+      toast.success('All memories cleared');
+      load();
+    } catch {
+      toast.error('Failed to clear');
+    }
+  };
+
+  if (loading) return (
+    <div style={{ padding: 40, textAlign: 'center' }}>
+      <div className="loading-dots"><span /><span /><span /></div>
+    </div>
+  );
+
+  return (
+    <div style={{ maxWidth: 760 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <div>
+          <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Memory Store</h2>
+          <p className="text-muted text-sm">
+            Persistent key-value store for preferences, project context, and facts. {memories.length} entries.
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {memories.length > 0 && (
+            <button className="btn btn-danger btn-sm" onClick={handleClear}>Clear All</button>
+          )}
+          <button className="btn btn-primary btn-sm" onClick={() => setShowAdd(!showAdd)}>
+            {showAdd ? '✕' : '+ Add Memory'}
+          </button>
+        </div>
+      </div>
+
+      {/* Stats */}
+      {categories.length > 0 && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+          <button
+            className={`btn btn-sm ${filter.category === '' ? 'btn-secondary' : 'btn-ghost'}`}
+            onClick={() => setFilter({ ...filter, category: '' })}
+          >
+            All ({memories.length})
+          </button>
+          {categories.map((c) => (
+            <button
+              key={c.category}
+              className={`btn btn-sm ${filter.category === c.category ? 'btn-secondary' : 'btn-ghost'}`}
+              onClick={() => setFilter({ ...filter, category: c.category })}
+            >
+              {c.category} ({c.count})
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Search */}
+      <div style={{ marginBottom: 16 }}>
+        <input
+          className="form-input"
+          placeholder="🔍 Search memories..."
+          value={filter.search}
+          onChange={(e) => setFilter({ ...filter, search: e.target.value })}
+        />
+      </div>
+
+      {/* Add form */}
+      {showAdd && (
+        <form onSubmit={handleSave} className="card" style={{ marginBottom: 20 }}>
+          <div className="card-header">
+            <span className="card-title">🧠 Add Memory Entry</span>
+          </div>
+          <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div className="form-row">
+              <div className="form-group">
+                <label className="form-label">Key</label>
+                <input
+                  className="form-input"
+                  placeholder="e.g. preferred_language"
+                  value={form.key}
+                  onChange={(e) => setForm({ ...form, key: e.target.value })}
+                  required
+                />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Category</label>
+                <select
+                  className="form-select"
+                  value={form.category}
+                  onChange={(e) => setForm({ ...form, category: e.target.value })}
+                >
+                  {CATEGORIES.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="form-group">
+              <label className="form-label">Value</label>
+              <textarea
+                className="form-input"
+                rows={3}
+                placeholder="The value to store..."
+                value={form.value}
+                onChange={(e) => setForm({ ...form, value: e.target.value })}
+                required
+                style={{ resize: 'vertical' }}
+              />
+            </div>
+            <button className="btn btn-primary btn-sm" type="submit" disabled={saving}>
+              {saving ? 'Saving...' : '💾 Save Memory'}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {/* Memory list */}
+      {memories.length === 0 ? (
+        <div className="empty-state">
+          <div className="empty-icon">🧠</div>
+          <div className="empty-title">No memories stored</div>
+          <div className="empty-desc">Add preferences, project context, or facts for AI agents to reference</div>
+        </div>
+      ) : (
+        <div className="memory-grid">
+          {memories.map((mem) => (
+            <div key={mem.id} className="memory-item">
+              <div className="memory-key">{mem.key}</div>
+              <div className="memory-value">{mem.value}</div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, flexShrink: 0 }}>
+                <span className="memory-category">{mem.category}</span>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button
+                    className="btn btn-danger btn-sm btn-icon"
+                    style={{ padding: '3px 6px', fontSize: 11 }}
+                    onClick={() => handleDelete(mem.id, mem.key)}
+                    title="Delete"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

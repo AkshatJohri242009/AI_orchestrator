@@ -1,0 +1,222 @@
+const { callProvider } = require('./providers');
+const { getDecryptedKey } = require('../controllers/keysController');
+const { query } = require('../database/db');
+const logger = require('../utils/logger');
+
+/**
+ * Run a single agent
+ */
+const runSingleAgent = async (userId, agentConfig, messages) => {
+  const { provider, model, temperature, max_tokens, system_prompt } = agentConfig;
+
+  // Decrypt API key just-in-time
+  const apiKey = await getDecryptedKey(userId, provider);
+
+  // Prepend system prompt if provided
+  const fullMessages = system_prompt
+    ? [{ role: 'system', content: system_prompt }, ...messages]
+    : messages;
+
+  const result = await callProvider(provider, apiKey, model, fullMessages, {
+    temperature,
+    maxTokens: max_tokens,
+  });
+
+  return result;
+};
+
+/**
+ * RACE MODE: Run multiple agents in parallel, collect all results
+ * Fails gracefully if some agents fail
+ */
+const runRaceMode = async (userId, agentConfigs, messages) => {
+  const racePromises = agentConfigs.map(async (config) => {
+    try {
+      const result = await runSingleAgent(userId, config, messages);
+      return { ...result, agentName: config.name, success: true };
+    } catch (error) {
+      logger.warn('Agent failed in race mode', {
+        provider: config.provider,
+        error: error.message,
+      });
+      return {
+        provider: config.provider,
+        model: config.model,
+        agentName: config.name,
+        success: false,
+        error: error.message,
+        content: null,
+      };
+    }
+  });
+
+  const results = await Promise.allSettled(racePromises);
+  
+  return results.map((r) => {
+    if (r.status === 'fulfilled') return r.value;
+    return { success: false, error: r.reason?.message || 'Unknown error' };
+  });
+};
+
+/**
+ * DEBATE MODE: Agents respond to each other's outputs
+ */
+const runDebateMode = async (userId, agentConfigs, topic, rounds = 2) => {
+  const transcript = [];
+  let currentMessages = [
+    { role: 'user', content: `Topic for debate: ${topic}. Please provide your initial position.` },
+  ];
+
+  for (let round = 0; round < rounds; round++) {
+    const roundResults = [];
+    
+    for (const config of agentConfigs) {
+      try {
+        // If not first round, include opponent's last response
+        const messagesForAgent = [...currentMessages];
+        
+        if (round > 0 && transcript.length > 0) {
+          const lastRound = transcript[transcript.length - 1];
+          const opponentResults = lastRound.filter((r) => r.provider !== config.provider);
+          
+          if (opponentResults.length > 0) {
+            messagesForAgent.push({
+              role: 'user',
+              content: `Opponent's position: "${opponentResults[0].content}". Please respond to this.`,
+            });
+          }
+        }
+
+        const result = await runSingleAgent(userId, config, messagesForAgent);
+        roundResults.push({ ...result, agentName: config.name, round, success: true });
+      } catch (error) {
+        roundResults.push({
+          provider: config.provider,
+          agentName: config.name,
+          round,
+          success: false,
+          error: error.message,
+        });
+      }
+    }
+    
+    transcript.push(roundResults);
+  }
+
+  return transcript;
+};
+
+/**
+ * CHAIN MODE: Output of one agent feeds into the next
+ */
+const runChainMode = async (userId, agentConfigs, initialPrompt) => {
+  const chain = [];
+  let currentContent = initialPrompt;
+
+  for (const config of agentConfigs) {
+    try {
+      const messages = [{ role: 'user', content: currentContent }];
+      const result = await runSingleAgent(userId, config, messages);
+      
+      chain.push({ ...result, agentName: config.name, success: true });
+      currentContent = result.content; // Feed output to next agent
+    } catch (error) {
+      chain.push({
+        provider: config.provider,
+        agentName: config.name,
+        success: false,
+        error: error.message,
+      });
+      break; // Stop chain on failure
+    }
+  }
+
+  return chain;
+};
+
+/**
+ * AI JUDGE: Evaluate and compare responses
+ */
+const judgeResponses = async (userId, responses, originalPrompt) => {
+  // Try to use any available provider for judging
+  const providers = ['anthropic', 'openai', 'gemini'];
+  
+  for (const provider of providers) {
+    try {
+      const apiKey = await getDecryptedKey(userId, provider);
+      
+      const responseText = responses
+        .map((r, i) => `Response ${i + 1} (${r.provider}/${r.model}):\n${r.content}`)
+        .join('\n\n---\n\n');
+
+      const judgePrompt = `You are an impartial AI evaluator. Analyze these ${responses.length} AI responses to the prompt: "${originalPrompt}"\n\n${responseText}\n\nProvide:\n1. Winner (most accurate/helpful)\n2. Scores for each (1-10) on: accuracy, helpfulness, clarity\n3. Key differences\n4. Best response synthesis\n\nRespond in JSON format.`;
+
+      const judgeMessages = [{ role: 'user', content: judgePrompt }];
+      
+      // Use the default model for judging
+      const models = { anthropic: 'claude-3-5-haiku-20241022', openai: 'gpt-4o-mini', gemini: 'gemini-1.5-flash' };
+      
+      const result = await callProvider(provider, apiKey, models[provider], judgeMessages);
+      
+      // Parse JSON from response
+      let judgement = result.content;
+      try {
+        const jsonMatch = judgement.match(/\{[\s\S]*\}/);
+        if (jsonMatch) judgement = JSON.parse(jsonMatch[0]);
+      } catch {
+        // Return as text if not parseable JSON
+      }
+
+      return { provider, judgement, rawContent: result.content };
+    } catch (error) {
+      logger.debug('Judge provider failed, trying next', { provider, error: error.message });
+    }
+  }
+
+  return null;
+};
+
+/**
+ * Save conversation to database
+ */
+const saveConversation = async (userId, title, mode, tabType, messages, agentResults) => {
+  const { query: dbQuery } = require('../database/db');
+  
+  const conv = await dbQuery(
+    `INSERT INTO conversations (user_id, title, mode, tab_type)
+     VALUES ($1, $2, $3, $4) RETURNING id`,
+    [userId, title || `Conversation ${new Date().toLocaleDateString()}`, mode, tabType]
+  );
+
+  const convId = conv.rows[0].id;
+
+  // Save user messages
+  for (const msg of messages) {
+    await dbQuery(
+      `INSERT INTO messages (conversation_id, role, content) VALUES ($1, $2, $3)`,
+      [convId, msg.role, msg.content]
+    );
+  }
+
+  // Save agent responses
+  for (const result of agentResults) {
+    if (result.content) {
+      await dbQuery(
+        `INSERT INTO messages (conversation_id, role, content, provider, model, tokens_used, latency_ms, is_error)
+         VALUES ($1, 'assistant', $2, $3, $4, $5, $6, $7)`,
+        [convId, result.content, result.provider, result.model, result.tokensUsed, result.latencyMs, !result.success]
+      );
+    }
+  }
+
+  return convId;
+};
+
+module.exports = {
+  runSingleAgent,
+  runRaceMode,
+  runDebateMode,
+  runChainMode,
+  judgeResponses,
+  saveConversation,
+};
